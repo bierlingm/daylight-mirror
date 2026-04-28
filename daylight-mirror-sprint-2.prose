@@ -1,0 +1,488 @@
+# Daylight Mirror Sprint 2
+#
+# Tackles all remaining open beads from the improvement backlog.
+# Focuses on P1 bugs first, then P2 features, then P3 polish.
+#
+# Prerequisites: Sprint 1 PRs merged (code signing, README, cask)
+# Usage: prose run daylight-mirror-sprint-2.prose
+# Run from: ~/werk/wield/daylight-mirror/
+
+input repo_path: "~/werk/wield/daylight-mirror"
+
+# ============================================================================
+# Agents
+# ============================================================================
+
+agent lead:
+  model: opus
+  persist: project
+  prompt: """
+You are the lead engineer improving Daylight Mirror, a macOS menu bar app
+that mirrors your screen to a Daylight DC-1 tablet over USB.
+
+Repo: {repo_path}
+GitHub: https://github.com/welfvh/daylight-mirror
+
+Your workflow:
+1. Check beads for ready work: `br ready --json`
+2. Pick the highest-priority unblocked issue
+3. Mark it in-progress: `br update <id> --status in_progress`
+4. Delegate to the right specialist
+5. Review their work
+6. Close the bead: `br close <id> --reason "Done: <summary>"`
+7. Repeat until no ready work remains
+
+Always work from the beads graph. Never invent work outside it.
+"""
+
+agent swift_dev:
+  model: opus
+  prompt: """
+You are a senior Swift/macOS developer. You work on:
+- ScreenCaptureKit, AppKit, SwiftUI menu bar apps
+- Code signing (Developer ID, ad-hoc, notarization)
+- USB communication and ADB integration
+- Performance profiling and optimization
+
+You write clean, minimal Swift. You test changes before declaring done.
+Working directory: {repo_path}
+"""
+
+agent android_dev:
+  model: sonnet
+  prompt: """
+You are an Android/Kotlin developer working on the Daylight Mirror companion app.
+- Fix package naming, manifest configuration
+- USB communication with the Mac host
+- Frame rendering on the DC-1's display
+- App icons, resources, and polish
+
+Working directory: {repo_path}
+"""
+
+agent infra_dev:
+  model: sonnet
+  prompt: """
+You are a CI/CD and release engineering specialist.
+- GitHub Actions workflows
+- Build automation, artifact publishing
+- Homebrew cask maintenance
+- Release process documentation
+
+Working directory: {repo_path}
+"""
+
+agent docs_writer:
+  model: haiku
+  prompt: """
+You are a technical writer. You write honest, concise documentation.
+No marketing fluff. State what works, what doesn't, and known limitations.
+Working directory: {repo_path}
+"""
+
+# ============================================================================
+# Phase 1: Orientation — understand current state after Sprint 1
+# ============================================================================
+
+let state = session: lead
+  prompt: """
+Explore the repo at {repo_path}. Understand:
+1. Current state of all beads: `br list --json` and `br ready --json`
+2. What PRs from Sprint 1 have been merged (check git log)
+3. Current code in Sources/MirrorEngine/MirrorEngine.swift
+4. Current Makefile and build process
+5. Dependency graph: `bv --robot-plan` and `bv --robot-insights`
+
+Produce a clear picture of what's ready to work on and what's blocked.
+"""
+
+# ============================================================================
+# Phase 2: P1 Bugs — critical path work
+# ============================================================================
+
+let triage = resume: lead
+  prompt: """
+From the current state, identify all P1 bugs that are ready (unblocked).
+Expected P1 work:
+- bd-1v0: Achieve 30 FPS (dirty-pixel is implemented but may need tuning)
+- bd-ikz: First-run permissions flow crashes
+- bd-2fw: DC-1 blank screen after setup
+- bd-36n: Record demo video (blocked by FPS — skip if still blocked)
+
+Propose execution order for P1 bugs. Mark first ones in-progress.
+"""
+  context: state
+
+# -- FPS fix: validate and tune the dirty-pixel workaround --
+
+let fps_fix = session: swift_dev
+  prompt: """
+Fix the FPS issue (bd-1v0). The dirty-pixel CompositorPacer is already
+implemented in MirrorEngine.swift but FPS is still ~13.
+
+Investigation from Sprint 1 identified these next steps:
+1. Verify the pacer window lives on the VIRTUAL display's NSScreen, not the main screen
+2. If it's on the wrong screen, move it to the virtual display
+3. Try a larger dirty region (e.g. 2x2 or small strip) if 1x1 isn't enough
+4. Check if CADisplayLink is actually firing at 30Hz (add logging)
+5. Profile with Instruments to find the actual bottleneck
+
+Read the CompositorPacer class and MirrorEngine.start() carefully.
+The key insight: macOS only recomposites screens that have dirty
+regions. If the pacer window is on NSScreen.main but we're capturing
+a virtual display, the virtual display's compositor never sees the
+dirty pixel.
+
+Make the fix. Test with `swift build -c release` to verify it compiles.
+
+Mark bead done: `br close bd-1v0 --reason "..."`
+"""
+  context: { state, triage }
+
+# -- Permissions flow fix --
+
+let permissions_fix = session: swift_dev
+  prompt: """
+Fix the first-run permissions crash (bd-ikz, GitHub issue #10).
+
+The app crashes when Screen Recording permission hasn't been granted.
+SCStream throws an error that isn't caught gracefully.
+
+1. Read Sources/App/DaylightMirrorApp.swift — find the SetupView and
+   permission checking code
+2. Read Sources/MirrorEngine/MirrorEngine.swift — find where SCStream
+   is initialized and where it could throw
+3. Add graceful error handling:
+   - Check CGPreflightScreenCaptureAccess() before starting capture
+   - If not granted, call CGRequestScreenCaptureAccess() and show
+     a clear message in the UI
+   - Never crash — show the setup wizard instead
+4. Test with `swift build -c release`
+
+Mark bead done: `br close bd-ikz --reason "..."`
+"""
+  context: state
+
+# -- Blank screen debug --
+
+let blank_screen_fix = session: swift_dev
+  prompt: """
+Debug the DC-1 blank screen issue (bd-2fw, GitHub issue #11).
+
+Users report: Mac shows "Waiting for client" but DC-1 stays blank
+after setup. This suggests the Android app connects but frames
+aren't rendering.
+
+1. Read android/app/src/main/cpp/mirror_native.c — the TCP receiver
+   and frame renderer
+2. Read android/app/src/main/java/com/daylight/mirror/MirrorActivity.kt
+3. Check for common failure modes:
+   - ADB reverse tunnel not set up (port 8888 not forwarded)
+   - Surface not ready when native code starts
+   - Frame size mismatch (server sends one resolution, client expects another)
+   - First keyframe never arrives (client waits for delta but needs keyframe)
+4. Add defensive checks:
+   - Verify tunnel with a TCP connect test before starting
+   - Log frame reception in native code
+   - Show connection state on Android (connected/receiving/rendering)
+5. If you find the root cause, fix it. If not, add diagnostic logging.
+
+Mark bead done or update with findings.
+"""
+  context: state
+
+# ============================================================================
+# Phase 3: Lead reviews P1 fixes
+# ============================================================================
+
+let p1_review = resume: lead
+  prompt: """
+Review all P1 fixes:
+1. FPS fix — did we solve the ~13 FPS problem?
+2. Permissions flow — does the app handle missing permissions gracefully?
+3. Blank screen — did we find the root cause?
+
+For each: check the changes compile, are minimal, and actually fix the issue.
+Close beads for anything that's good. Flag rework needed.
+
+Also check: is bd-36n (demo video) now unblocked? Update its status if so.
+"""
+  context: { fps_fix, permissions_fix, blank_screen_fix }
+
+# ============================================================================
+# Phase 4: P2 work — parallel tracks
+# ============================================================================
+
+resume: lead
+  prompt: "Starting P2 work. Mark next issues in-progress."
+  context: p1_review
+
+parallel:
+  # -- CI/CD and release binaries --
+  release_ci = session: infra_dev
+    prompt: """
+Set up CI/CD and ship release binaries (bd-2do).
+
+Sprint 1 drafted a GitHub Actions workflow. Now implement it:
+
+1. Read the drafted workflow from .prose/runs/20260210-230534-b83e93/bindings/release_check.md
+2. Create .github/workflows/release.yml that:
+   - Triggers on v* tag push
+   - Builds Mac app (swift build -c release, create .app bundle, codesign, zip)
+   - Builds Android APK (./gradlew assembleDebug)
+   - Uploads both to the GitHub release
+3. Make sure the workflow uses the same bundle creation logic as the Makefile
+4. Document manual steps for retroactively building v1.1/v1.2
+
+Mark bead done: `br close bd-2do --reason "..."`
+"""
+    context: state
+
+  # -- Connection flickering fix --
+  flicker_fix = session: swift_dev
+    prompt: """
+Fix connection state flickering during reconnect (bd-2x2, GitHub issue #13).
+
+The status overlay on Android flickers during reconnection — the 500ms
+debounce is insufficient.
+
+1. Read MirrorActivity.kt — find the status overlay show/hide logic
+2. Read mirror_native.c — find where connection state changes
+3. Increase debounce or implement a state machine:
+   - connected → disconnected: wait 2s before showing overlay
+   - disconnected → connected: hide overlay immediately
+   - connecting: show "Reconnecting..." (not the full "Waiting" screen)
+4. Test with `cd android && ./gradlew assembleDebug`
+
+Mark bead done: `br close bd-2x2 --reason "..."`
+"""
+    context: state
+
+  # -- Portrait orientation --
+  portrait = session: swift_dev
+    prompt: """
+Add portrait (vertical) orientation support (bd-1u8, GitHub issue #12).
+
+The DC-1 is 1600x1200 (landscape). Portrait would be 1200x1600.
+
+1. Read MirrorEngine.swift — find the DisplayResolution enum and
+   VirtualDisplayManager
+2. Add portrait variants to DisplayResolution:
+   - portrait_cozy: 600x800 (HiDPI → 1200x1600)
+   - portrait_balanced: 960x1280
+   - portrait_sharp: 1200x1600
+3. Update the ControlSocket to accept portrait resolutions
+4. Update the CLI to list portrait options
+5. The Android side should handle any resolution dynamically
+   (check mirror_native.c — does it read frame dimensions from packets?)
+6. Test with `swift build -c release`
+
+Mark bead done: `br close bd-1u8 --reason "..."`
+"""
+    context: state
+
+  # -- Android app icon --
+  app_icon = session: android_dev
+    prompt: """
+Add an Android app icon (bd-1nn, GitHub issue #9).
+
+The app has no icon in the DC-1 launcher — it shows the default Android icon.
+
+1. Create a simple, monochrome icon that fits the e-ink aesthetic:
+   - A monitor/display outline, minimal, works at small sizes
+   - Use Android adaptive icon format (foreground + background layers)
+2. Add the icon resources:
+   - android/app/src/main/res/mipmap-mdpi/ through mipmap-xxxhdpi/
+   - Or use a vector drawable in mipmap-anydpi-v26/
+3. Update AndroidManifest.xml to reference the icon
+4. Test with `cd android && ./gradlew assembleDebug`
+
+For the icon design: create a simple vector drawable (XML). A circle
+with a screen/monitor silhouette inside works well for monochrome e-ink.
+
+Mark bead done: `br close bd-1nn --reason "..."`
+"""
+    context: state
+
+# ============================================================================
+# Phase 5: Lead reviews P2 work
+# ============================================================================
+
+let p2_review = resume: lead
+  prompt: """
+Review all P2 fixes:
+1. CI/CD workflow — does it look correct for GitHub Actions?
+2. Connection flickering — is the debounce/state machine sensible?
+3. Portrait orientation — are the resolutions correct for the DC-1?
+4. Android app icon — does it exist and look reasonable?
+
+Close beads for good work. Flag rework.
+
+Check: are any previously-blocked beads now unblocked?
+- bd-1dy (embed ADB) — was blocked on signing + releases
+- bd-3aj (zero-config USB) — was blocked on ADB embedding
+- bd-2z7 (bundle APK) — was blocked on ADB embedding
+Run `br ready --json` to check.
+"""
+  context: { release_ci, flicker_fix, portrait, app_icon }
+
+# ============================================================================
+# Phase 6: P2 blocked items — ADB embedding unlocks the UX track
+# ============================================================================
+
+let adb_embed = session: swift_dev
+  prompt: """
+Embed a minimal ADB binary in the Mac app (bd-1dy).
+
+This is the key enabler for zero-config setup. Currently users must
+install ADB separately via Homebrew.
+
+1. Research: what's the minimum ADB binary needed?
+   - Just `adb` from Android platform-tools (~6MB)
+   - No need for fastboot, etc.
+2. Add the ADB binary to the app bundle:
+   - Resources/adb or a dedicated tools/ directory
+   - Copy it into the .app bundle during `make install`
+3. Update MirrorEngine.swift's ADBBridge to:
+   - First check for bundled ADB at Bundle.main.resourcePath
+   - Fall back to PATH lookup (homebrew adb)
+   - Log which ADB is being used
+4. Update the Makefile to download platform-tools if not present
+5. Test with `swift build -c release`
+
+IMPORTANT: Don't actually download or commit a binary in this session.
+Instead, prepare the code changes and document the download/embed steps.
+
+Mark bead done: `br close bd-1dy --reason "..."`
+"""
+  context: { state, p2_review }
+
+# ============================================================================
+# Phase 7: Zero-config and bundle APK (depend on ADB embed)
+# ============================================================================
+
+parallel:
+  zero_config = session: swift_dev
+    prompt: """
+Implement zero-config USB detection (bd-3aj).
+
+With ADB now embedded (bd-1dy), the app can detect a connected DC-1
+without user intervention.
+
+1. Read MirrorEngine.swift — find the ADB tunnel setup code
+2. Add USB device monitoring:
+   - Use IOKit to detect USB device connect/disconnect
+   - Filter for Daylight DC-1 (vendor/product ID)
+   - On connect: auto-run adb reverse tunnel + start mirroring
+   - On disconnect: stop mirroring, show "Connect your Daylight"
+3. Add a "device detected" state to MirrorStatus
+4. Update the menu bar UI to show device connection state
+5. Test with `swift build -c release`
+
+If you can't find the DC-1's USB vendor/product ID, use ADB device
+detection (polling `adb devices` every 2s) as a simpler alternative.
+
+Mark bead done: `br close bd-3aj --reason "..."`
+"""
+    context: { state, adb_embed }
+
+  bundle_apk = session: swift_dev
+    prompt: """
+Bundle the Android APK inside the Mac app (bd-2z7).
+
+With ADB embedded, the Mac app can also carry the Android APK and
+install it automatically on first connect.
+
+1. Add the APK to the app bundle (Resources/app-debug.apk)
+2. On first device detection (from bd-3aj):
+   - Check if the Android app is installed: `adb shell pm list packages | grep com.daylight.mirror`
+   - If not installed, run: `adb install <bundled-apk-path>`
+   - Show progress in the menu bar
+3. Update the Makefile to include the APK in the bundle
+4. Handle errors gracefully (device not in debug mode, install fails)
+
+IMPORTANT: Don't actually bundle a binary. Prepare the code changes
+and document the build steps.
+
+Mark bead done: `br close bd-2z7 --reason "..."`
+"""
+    context: { state, adb_embed }
+
+# ============================================================================
+# Phase 8: Remaining P3 items
+# ============================================================================
+
+parallel:
+  auto_reconnect = session: swift_dev
+    prompt: """
+Implement auto-reconnect on USB disconnect (bd-2d8).
+
+When the USB cable is unplugged and re-plugged, the app should
+automatically re-establish the connection.
+
+1. This builds on the USB detection from bd-3aj
+2. On disconnect event:
+   - Pause streaming (don't crash)
+   - Show "Reconnecting..." in menu bar
+   - Poll for device every 2s
+3. On reconnect:
+   - Re-establish ADB tunnel
+   - Resume streaming
+   - Clear reconnecting state
+4. Add a configurable auto-reconnect toggle in the menu
+
+Mark bead done: `br close bd-2d8 --reason "..."`
+"""
+    context: { state, zero_config }
+
+  menu_status = session: swift_dev
+    prompt: """
+Add connection status to the menu bar icon (bd-cb6).
+
+Show the current state visually in the menu bar:
+1. Green dot: connected and streaming
+2. Yellow dot: reconnecting
+3. Red dot: error
+4. No dot: idle/stopped
+
+Read DaylightMirrorApp.swift — find the MenuBarExtra and its label.
+Use SF Symbols or a simple colored circle overlay.
+
+Mark bead done: `br close bd-cb6 --reason "..."`
+"""
+    context: { state, zero_config }
+
+# ============================================================================
+# Phase 9: Demo video decision
+# ============================================================================
+
+let demo_check = resume: lead
+  prompt: """
+Check if bd-36n (record demo video) is now feasible:
+- Is FPS acceptable after fixes?
+- Are the P1 bugs resolved?
+
+If yes, outline what the demo should show and update the bead.
+If no, document what's still blocking it.
+"""
+  context: { p1_review, p2_review }
+
+# ============================================================================
+# Phase 10: Final status report
+# ============================================================================
+
+output summary = resume: lead
+  prompt: """
+Sprint 2 complete. Generate a comprehensive status report:
+
+1. Run `br list --json` for final bead state
+2. List every bead and its status (closed/open/blocked/in_progress)
+3. What was fixed/built in this sprint
+4. What remains and why
+5. Any new issues discovered (file as beads)
+6. Recommended next actions for Sprint 3
+7. Which changes are ready to PR
+
+Format as clean markdown. Be honest about what worked and what didn't.
+"""
+  context: { p1_review, p2_review, adb_embed, zero_config, bundle_apk, auto_reconnect, menu_status, demo_check }

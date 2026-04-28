@@ -1,0 +1,275 @@
+# Daylight Mirror 10x Improvement
+#
+# Beads-driven improvement program for welfvh/daylight-mirror.
+# Clones the repo, reads beads for prioritized work, and executes
+# fixes across distribution, UX, product, and trust tracks.
+#
+# Usage: prose run improve-daylight-mirror.prose
+# Run from: ~/werk/wield/daylight-mirror/
+
+input repo_path: "~/werk/wield/daylight-mirror"
+
+# ============================================================================
+# Lead agent: coordinates all work via beads
+# ============================================================================
+
+agent lead:
+  model: opus
+  persist: project
+  prompt: """
+You are the lead engineer improving Daylight Mirror, a macOS menu bar app
+that mirrors your screen to a Daylight DC-1 tablet over USB.
+
+Repo: {repo_path}
+GitHub: https://github.com/welfvh/daylight-mirror
+
+Your workflow:
+1. Check beads for ready work: `br ready --json`
+2. Pick the highest-priority unblocked issue
+3. Mark it in-progress: `br update <id> --status in_progress`
+4. Delegate to the right specialist
+5. Review their work
+6. Close the bead: `br close <id> --reason "Done: <summary>"`
+7. Repeat until no ready work remains
+
+Always work from the beads graph. Never invent work outside it.
+"""
+
+agent swift_dev:
+  model: opus
+  prompt: """
+You are a senior Swift/macOS developer. You work on:
+- ScreenCaptureKit, AppKit, SwiftUI menu bar apps
+- Code signing (Developer ID, ad-hoc, notarization)
+- Homebrew cask formulas
+- USB communication and ADB integration
+
+You write clean, minimal Swift. You test changes before declaring done.
+Working directory: {repo_path}
+"""
+
+agent android_dev:
+  model: sonnet
+  prompt: """
+You are an Android/Kotlin developer working on the Daylight Mirror companion app.
+- Fix package naming, manifest configuration
+- USB communication with the Mac host
+- Frame rendering on the DC-1's display
+
+Working directory: {repo_path}
+"""
+
+agent docs_writer:
+  model: sonnet
+  prompt: """
+You are a technical writer. You write honest, concise documentation.
+No marketing fluff. State what works, what doesn't, and known limitations.
+Match the voice of a solo developer shipping an alpha.
+
+Working directory: {repo_path}
+"""
+
+# ============================================================================
+# Phase 1: Understand the codebase
+# ============================================================================
+
+let codebase = session: lead
+  prompt: """
+Explore the repo at {repo_path}. Understand:
+1. Directory structure (Mac app, Android app, CLI, shared code)
+2. Build system (Xcode? SPM? Gradle?)
+3. How screen capture works (SCStream usage)
+4. How USB streaming works (protocol, frame format)
+5. Current state of code signing setup
+
+Use Glob and Read. Be thorough. This context feeds all later work.
+"""
+
+# ============================================================================
+# Phase 2: Triage — check beads, pick ready work
+# ============================================================================
+
+let plan = resume: lead
+  prompt: """
+Now check the beads graph:
+
+```bash
+br ready --json
+```
+
+Review all ready (unblocked) issues. Group them into tracks:
+- **Track A (Distribution)**: Cask fix, signing, release binaries
+- **Track B (Bugs)**: Package name mismatch, FPS
+- **Track C (Docs)**: README honesty, demo video note
+- **Track D (UX)**: Zero-config, bundle APK, embed ADB (these are blocked, skip for now)
+
+Propose an execution order for unblocked work. Prioritize P1 bugs first.
+"""
+  context: codebase
+
+# ============================================================================
+# Phase 3: Execute — Distribution fixes (parallel where possible)
+# ============================================================================
+
+resume: lead
+  prompt: "Starting execution. Mark first issues in-progress."
+  context: plan
+
+parallel:
+  cask_fix = session: swift_dev
+    prompt: """
+Fix the Homebrew cask formula.
+
+The issue: APK download URL returns 'Not Found'. The actual APK asset
+in the v1.0 release is named `app-debug.apk`, not `DaylightMirror.apk`.
+
+1. Find the cask formula (likely in a homebrew-tap repo or local tap)
+2. Fix the APK URL to point to the correct asset
+3. Also check the Mac app download URL is correct
+
+If the tap is at /opt/homebrew/Library/Taps/welfvh/homebrew-tap,
+read and fix the cask file there.
+
+Mark bead done when fixed: `br close <id> --reason "..."`
+"""
+    context: { codebase, plan }
+
+  signing_fix = session: swift_dev
+    prompt: """
+Fix Mac app code signing.
+
+The issue: App has broken signature — 'code has no resources but
+signature indicates they must be present'. Gatekeeper blocks launch.
+
+Options (in order of preference):
+1. Fix the Xcode build to produce a valid ad-hoc signature
+2. Add a proper codesign step to the build/release process
+3. If there's a Makefile or build script, add signing there
+
+Look at the Xcode project settings, any build scripts, and the
+release workflow. The goal: users can open the app without xattr hacks.
+
+Mark bead done when fixed.
+"""
+    context: { codebase, plan }
+
+  pkg_name_fix = session: android_dev
+    prompt: """
+Fix Android package name mismatch.
+
+The issue: Documentation and cask reference `com.welfvh.daylightmirror`
+but the actual installed package is `com.daylight.mirror`.
+
+1. Check AndroidManifest.xml for the actual package name
+2. Update all documentation, scripts, and setup instructions to match
+3. Or if the package name should change, update the manifest
+
+Ensure consistency between code and docs.
+
+Mark bead done when fixed.
+"""
+    context: { codebase, plan }
+
+# ============================================================================
+# Phase 4: Lead reviews distribution fixes
+# ============================================================================
+
+let dist_review = resume: lead
+  prompt: """
+Review the distribution fixes:
+1. Cask formula fix
+2. Code signing fix
+3. Package name fix
+
+For each: check the changes are correct, minimal, and actually fix the issue.
+Flag anything that needs rework.
+
+Close the corresponding beads for anything that's good.
+"""
+  context: { cask_fix, signing_fix, pkg_name_fix }
+
+# ============================================================================
+# Phase 5: FPS investigation
+# ============================================================================
+
+let fps_investigation = session: swift_dev
+  prompt: """
+Investigate the FPS issue (GitHub issue #15).
+
+The claim is 30 FPS but actual is ~13. The author's analysis points to
+SCStream not delivering frames when the screen is static (macOS compositor
+optimization). A proposed workaround is a 1-pixel dirty trick.
+
+1. Find the SCStream capture code
+2. Understand the current frame delivery mechanism
+3. Implement or verify the dirty-pixel workaround
+4. If you can test, measure before/after FPS
+
+This is the core product quality issue. Take your time.
+
+Mark bead done or update with findings.
+"""
+  context: codebase
+
+# ============================================================================
+# Phase 6: Documentation
+# ============================================================================
+
+let readme_update = session: docs_writer
+  prompt: """
+Update the README to be honest about alpha status.
+
+1. Read the current README
+2. Replace any aspirational performance claims with honest current state
+3. Add a "Known Issues" section listing:
+   - FPS currently ~13 (working on it)
+   - Requires manual xattr/codesign workaround on macOS (until signing is fixed)
+   - USB only (no WiFi)
+4. Add "Alpha" label prominently
+5. Keep the setup instructions but make them accurate
+6. Note: an external user (Moritz Bierling) has confirmed basic mirroring works
+
+Don't make it sound bad — make it sound honest and actively maintained.
+
+Mark bead done when complete.
+"""
+  context: { codebase, dist_review }
+
+# ============================================================================
+# Phase 7: Release binaries for existing tags
+# ============================================================================
+
+let release_check = session: swift_dev
+  prompt: """
+Check what's needed to ship binaries for v1.1-v1.3 tags.
+
+1. Is there a CI/release workflow (GitHub Actions)?
+2. If yes, check why v1.1-v1.3 didn't produce artifacts
+3. If no, document the manual build+release steps
+4. Create or fix the release workflow so future tags auto-publish
+
+Don't actually push releases — just prepare the fix.
+
+Mark bead done or update with findings.
+"""
+  context: codebase
+
+# ============================================================================
+# Phase 8: Final status report
+# ============================================================================
+
+output summary = resume: lead
+  prompt: """
+Session complete. Generate a status report:
+
+1. List each bead and its current status (closed/open/blocked)
+2. What was fixed in this session
+3. What remains blocked and why
+4. Recommended next actions
+5. Any new issues discovered during work (file as beads)
+
+Run `br list --json` to get final state.
+
+Format as a clean markdown summary.
+"""
+  context: { dist_review, fps_investigation, readme_update, release_check }
